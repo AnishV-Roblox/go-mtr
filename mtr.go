@@ -69,6 +69,12 @@ func parseHostnum(line []byte) (num int, finalFieldIdx int) {
 	return parseByteNum(line[2:finalFieldIdx]), finalFieldIdx + 1 // `c ### <content>`
 }
 
+// Wait waits for the MTR call to complete and returns the error if any.
+func (m *MTR) Wait() error {
+	<-m.Done
+	return m.Error
+}
+
 func (m *MTR) processOutput() {
 	// h (host): host #, ip address
 	// d (dns): host #, resolved dns name
