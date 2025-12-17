@@ -1,6 +1,7 @@
 go-mtr
 ======
 
+#### (unstable, under active development)
 A go wrapper on the mtr process. This package uses `mtr --raw` and
 parses the output. The results are slightly different than running
 `mtr --report` directly because `mtr` itself keeps a running total
