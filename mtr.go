@@ -12,9 +12,13 @@ import (
 )
 
 type Host struct {
-	IP              net.IP  `json:"ip"`
-	Name            string  `json:"hostname"`
-	Hop             int     `json:"hop-number"`
+	IP   net.IP `json:"ip"`
+	Name string `json:"hostname"`
+}
+
+type Hop struct {
+	Hosts           []*Host `json:"hosts"`
+	HopNumber       int     `json:"hop-number"`
 	PacketMicrosecs []int   `json:"packet-times"`
 	Sent            int     `json:"sent"`
 	Received        int     `json:"received"`
@@ -35,7 +39,7 @@ type MTR struct {
 	OutputRaw   []byte
 	Error       error
 	PacketsSent int
-	Hosts       []*Host `json:"hosts"`
+	Hops        []*Hop `json:"hops"`
 }
 
 // New runs mtr --raw -c reportCycles hostname args... Thus, you can add more arguments
@@ -84,6 +88,14 @@ func (m *MTR) processOutput() {
 			m.Error = fmt.Errorf("Unable to process output, error %v, meaning the mtr output is WHACK! Check the output to see what's up!", x)
 		}
 	}()
+
+	// Track which hop index corresponds to which hop number
+	hopNumToIdx := make(map[int]int)
+
+	// Track which IPs we've seen at each hop for deduplication
+	// Key format: "hopnum:ip"
+	seenHostAtHop := make(map[string]bool)
+
 	output := m.OutputRaw
 	output = append(output, ' ') // tack on a space at the end so that `output = output[lineIdx+1:] doesn't panic on last newline
 	for {
@@ -94,41 +106,105 @@ func (m *MTR) processOutput() {
 		line := output[:lineIdx]
 		output = output[lineIdx+1:]
 
-		hostnum, finalFieldIdx := parseHostnum(line)
+		hopnum, finalFieldIdx := parseHostnum(line)
 
 		switch line[0] {
 		case 'h':
-			for len(m.Hosts) < hostnum+1 {
-				m.Hosts = append(m.Hosts, &Host{Hop: len(m.Hosts)})
+			// Get or create the hop
+			hopIdx, exists := hopNumToIdx[hopnum]
+			if !exists {
+				hop := &Hop{
+					HopNumber: hopnum,
+					Hosts:     []*Host{},
+				}
+				hopIdx = len(m.Hops)
+				m.Hops = append(m.Hops, hop)
+				hopNumToIdx[hopnum] = hopIdx
 			}
-			m.Hosts[hostnum].IP = net.ParseIP(string(line[finalFieldIdx:]))
+
+			// Add this IP to the hop's hosts if not already seen
+			ipStr := string(line[finalFieldIdx:])
+			key := fmt.Sprintf("%d:%s", hopnum, ipStr)
+			if !seenHostAtHop[key] {
+				seenHostAtHop[key] = true
+				m.Hops[hopIdx].Hosts = append(m.Hops[hopIdx].Hosts, &Host{
+					IP: net.ParseIP(ipStr),
+				})
+			}
+
 		case 'd':
-			m.Hosts[hostnum].Name = string(line[finalFieldIdx:])
+			// Find the hop and update the hostname for the matching IP
+			if hopIdx, ok := hopNumToIdx[hopnum]; ok {
+				hostname := string(line[finalFieldIdx:])
+				// Find the host with matching IP or hostname and update it
+				for i := range m.Hops[hopIdx].Hosts {
+					if m.Hops[hopIdx].Hosts[i].IP.String() == hostname ||
+						m.Hops[hopIdx].Hosts[i].Name == "" {
+						m.Hops[hopIdx].Hosts[i].Name = hostname
+						break
+					}
+				}
+			}
+
 		case 'p':
-			m.Hosts[hostnum].PacketMicrosecs = append(m.Hosts[hostnum].PacketMicrosecs, parseByteNum(line[finalFieldIdx:]))
+			// Add packet data to the hop (aggregated across all IPs)
+			if hopIdx, ok := hopNumToIdx[hopnum]; ok {
+				m.Hops[hopIdx].PacketMicrosecs = append(
+					m.Hops[hopIdx].PacketMicrosecs,
+					parseByteNum(line[finalFieldIdx:]),
+				)
+			}
+		}
+	}
+	m.filterDuplicateLastHops()
+
+	m.processHops()
+}
+
+// filterDuplicateLastHops removes consecutive hops at the end of the path
+// that have the same IP address. This handles MTR's behavior of reporting
+// the destination multiple times at increasing TTL values.
+func (m *MTR) filterDuplicateLastHops() {
+	if len(m.Hops) == 0 {
+		return
+	}
+
+	finalIdx := 0
+	var previousIP string
+
+	for idx, hop := range m.Hops {
+		if len(hop.Hosts) > 0 {
+			currentIP := hop.Hosts[0].IP.String()
+			if currentIP != previousIP {
+				previousIP = currentIP
+				finalIdx = idx + 1
+			}
 		}
 	}
 
-	m.processHosts()
+	// Trim to the last hop where IP changed
+	if finalIdx > 0 && finalIdx < len(m.Hops) {
+		m.Hops = m.Hops[0:finalIdx]
+	}
 }
 
-func (m *MTR) processHosts() {
-	for _, host := range m.Hosts {
-		host.Sent = m.PacketsSent
-		host.Received = len(host.PacketMicrosecs)
-		host.Dropped = host.Sent - host.Received
-		host.LostPercent = float64(host.Dropped) / float64(host.Sent)
-		if host.Received == 0 {
+func (m *MTR) processHops() {
+	for _, hop := range m.Hops {
+		hop.Sent = m.PacketsSent
+		hop.Received = len(hop.PacketMicrosecs)
+		hop.Dropped = hop.Sent - hop.Received
+		hop.LostPercent = float64(hop.Dropped) / float64(hop.Sent)
+		if hop.Received == 0 {
 			continue
 		}
 		totalPacketTime := 0
 		best := 1<<31 - 1
 		worst := 0
-		jitters := make([]int, host.Received)
+		jitters := make([]int, hop.Received)
 		worstJitter := 0
-		for i, packet := range host.PacketMicrosecs {
+		for i, packet := range hop.PacketMicrosecs {
 			if i > 0 {
-				newJitter := packet - host.PacketMicrosecs[i-1]
+				newJitter := packet - hop.PacketMicrosecs[i-1]
 				if newJitter < 0 {
 					newJitter = -newJitter
 				}
@@ -136,7 +212,7 @@ func (m *MTR) processHosts() {
 					worstJitter = newJitter
 				}
 				jitters[i] = newJitter
-				host.InterarrivalJitter += newJitter - ((host.InterarrivalJitter + 8) >> 4) // rfc3550 A.8
+				hop.InterarrivalJitter += newJitter - ((hop.InterarrivalJitter + 8) >> 4) // rfc3550 A.8
 			}
 			totalPacketTime += packet
 			if packet > worst {
@@ -147,18 +223,18 @@ func (m *MTR) processHosts() {
 			}
 		}
 		// mtr keeps a running average, so values may be different than a true average
-		host.Mean = float64(totalPacketTime) / float64(host.Received)
-		host.WorstJitter = worstJitter
-		host.Best = best
-		host.Worst = worst
+		hop.Mean = float64(totalPacketTime) / float64(hop.Received)
+		hop.WorstJitter = worstJitter
+		hop.Best = best
+		hop.Worst = worst
 		sqrDiff := float64(0)
 		jitterSum := 0
-		for i, packet := range host.PacketMicrosecs {
-			diff := float64(packet) - host.Mean
+		for i, packet := range hop.PacketMicrosecs {
+			diff := float64(packet) - hop.Mean
 			sqrDiff += diff * diff
 			jitterSum += jitters[i]
 		}
-		host.MeanJitter = float64(jitterSum) / float64(host.Received)
-		host.StandardDev = math.Sqrt(sqrDiff / float64(host.Mean))
+		hop.MeanJitter = float64(jitterSum) / float64(hop.Received)
+		hop.StandardDev = math.Sqrt(sqrDiff / float64(hop.Mean))
 	}
 }
