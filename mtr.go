@@ -37,6 +37,7 @@ type Hop struct {
 type MTR struct {
 	Done        chan struct{}
 	OutputRaw   []byte
+	CmdRaw      string
 	Error       error
 	PacketsSent int
 	Hops        []*Hop `json:"hops"`
@@ -52,7 +53,9 @@ func New(reportCycles int, host string, args ...string) *MTR {
 	args = append([]string{"--raw", "-c", strconv.Itoa(reportCycles), host}, args...)
 	go func() {
 		defer close(m.Done)
-		m.OutputRaw, m.Error = exec.Command("mtr", args...).Output()
+		cmd := exec.Command("mtr", args...)
+		m.OutputRaw, m.Error = cmd.Output()
+		m.CmdRaw = cmd.String()
 		if m.Error == nil {
 			m.processOutput()
 		}
