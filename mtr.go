@@ -68,7 +68,7 @@ func parseByteNum(input []byte) int {
 	return i
 }
 
-func parseHostnum(line []byte) (num int, finalFieldIdx int) {
+func parseHopNumber(line []byte) (num int, finalFieldIdx int) {
 	finalFieldIdx = bytes.IndexByte(line[2:], ' ') + 2
 	return parseByteNum(line[2:finalFieldIdx]), finalFieldIdx + 1 // `c ### <content>`
 }
@@ -106,7 +106,7 @@ func (m *MTR) processOutput() {
 		line := output[:lineIdx]
 		output = output[lineIdx+1:]
 
-		hopnum, finalFieldIdx := parseHostnum(line)
+		hopnum, finalFieldIdx := parseHopNumber(line)
 
 		switch line[0] {
 		case 'h':
