@@ -8,22 +8,23 @@ import (
 	"math"
 	"net"
 	"os/exec"
+	"sort"
 	"strconv"
 )
 
-type Host struct {
+type MTRHost struct {
 	IP   net.IP `json:"ip"`
 	Name string `json:"hostname"`
 }
 
 type Hop struct {
-	Hosts           []*Host `json:"hosts"`
-	HopNumber       int     `json:"hop-number"`
-	PacketMicrosecs []int   `json:"packet-times"`
-	Sent            int     `json:"sent"`
-	Received        int     `json:"received"`
-	Dropped         int     `json:"dropped"`
-	LostPercent     float64 `json:"lost-percent"`
+	Hosts           []*MTRHost `json:"hosts"`
+	HopNumber       int        `json:"hop-number"`
+	PacketMicrosecs []int      `json:"packet-times"`
+	Sent            int        `json:"sent"`
+	Received        int        `json:"received"`
+	Dropped         int        `json:"dropped"`
+	LostPercent     float64    `json:"lost-percent"`
 	// All packet units are in microseconds
 	Mean               float64 `json:"mean"`
 	Best               int     `json:"best"`
@@ -40,7 +41,7 @@ type MTR struct {
 	CmdRaw      string
 	Error       error
 	PacketsSent int
-	Hops        []*Hop `json:"hops"`
+	Hops        map[int]*Hop `json:"hops"` // Map of hop number -> Hop
 }
 
 // New runs mtr --raw -c reportCycles hostname args... Thus, you can add more arguments
@@ -48,7 +49,7 @@ type MTR struct {
 // when the MTR.Done chan closes. First wait for this, then check the MTR.Error field before
 // looking at the output. Other than that, the fields and json tags document what everything
 // means.
-func New(reportCycles int, host string, args ...string) *MTR {
+func NewMTR(reportCycles int, host string, args ...string) *MTR {
 	m := &MTR{Done: make(chan struct{}), PacketsSent: reportCycles}
 	args = append([]string{"--raw", "-c", strconv.Itoa(reportCycles), host}, args...)
 	go func() {
@@ -92,8 +93,8 @@ func (m *MTR) processOutput() {
 		}
 	}()
 
-	// Track which hop index corresponds to which hop number
-	hopNumToIdx := make(map[int]int)
+	// Initialize the Hops map
+	m.Hops = make(map[int]*Hop)
 
 	// Track which IPs we've seen at each hop for deduplication
 	// Key format: "hopnum:ip"
@@ -114,15 +115,13 @@ func (m *MTR) processOutput() {
 		switch line[0] {
 		case 'h':
 			// Get or create the hop
-			hopIdx, exists := hopNumToIdx[hopnum]
+			hop, exists := m.Hops[hopnum]
 			if !exists {
-				hop := &Hop{
+				hop = &Hop{
 					HopNumber: hopnum,
-					Hosts:     []*Host{},
+					Hosts:     []*MTRHost{},
 				}
-				hopIdx = len(m.Hops)
-				m.Hops = append(m.Hops, hop)
-				hopNumToIdx[hopnum] = hopIdx
+				m.Hops[hopnum] = hop
 			}
 
 			// Add this IP to the hop's hosts if not already seen
@@ -130,20 +129,20 @@ func (m *MTR) processOutput() {
 			key := fmt.Sprintf("%d:%s", hopnum, ipStr)
 			if !seenHostAtHop[key] {
 				seenHostAtHop[key] = true
-				m.Hops[hopIdx].Hosts = append(m.Hops[hopIdx].Hosts, &Host{
+				hop.Hosts = append(hop.Hosts, &MTRHost{
 					IP: net.ParseIP(ipStr),
 				})
 			}
 
 		case 'd':
 			// Find the hop and update the hostname for the matching IP
-			if hopIdx, ok := hopNumToIdx[hopnum]; ok {
+			if hop, ok := m.Hops[hopnum]; ok {
 				hostname := string(line[finalFieldIdx:])
 				// Find the host with matching IP or hostname and update it
-				for i := range m.Hops[hopIdx].Hosts {
-					if m.Hops[hopIdx].Hosts[i].IP.String() == hostname ||
-						m.Hops[hopIdx].Hosts[i].Name == "" {
-						m.Hops[hopIdx].Hosts[i].Name = hostname
+				for i := range hop.Hosts {
+					if hop.Hosts[i].IP.String() == hostname ||
+						hop.Hosts[i].Name == "" {
+						hop.Hosts[i].Name = hostname
 						break
 					}
 				}
@@ -151,9 +150,9 @@ func (m *MTR) processOutput() {
 
 		case 'p':
 			// Add packet data to the hop (aggregated across all IPs)
-			if hopIdx, ok := hopNumToIdx[hopnum]; ok {
-				m.Hops[hopIdx].PacketMicrosecs = append(
-					m.Hops[hopIdx].PacketMicrosecs,
+			if hop, ok := m.Hops[hopnum]; ok {
+				hop.PacketMicrosecs = append(
+					hop.PacketMicrosecs,
 					parseByteNum(line[finalFieldIdx:]),
 				)
 			}
@@ -172,22 +171,35 @@ func (m *MTR) filterDuplicateLastHops() {
 		return
 	}
 
-	finalIdx := 0
+	// Get all hop numbers and sort them
+	hopNumbers := make([]int, 0, len(m.Hops))
+	for hopNum := range m.Hops {
+		hopNumbers = append(hopNumbers, hopNum)
+	}
+	sort.Ints(hopNumbers)
+
+	// Find the last hop number where IP changed
+	lastValidHopNum := 0
 	var previousIP string
 
-	for idx, hop := range m.Hops {
+	for _, hopNum := range hopNumbers {
+		hop := m.Hops[hopNum]
 		if len(hop.Hosts) > 0 {
 			currentIP := hop.Hosts[0].IP.String()
 			if currentIP != previousIP {
 				previousIP = currentIP
-				finalIdx = idx + 1
+				lastValidHopNum = hopNum
 			}
 		}
 	}
 
-	// Trim to the last hop where IP changed
-	if finalIdx > 0 && finalIdx < len(m.Hops) {
-		m.Hops = m.Hops[0:finalIdx]
+	// Remove hops after the last valid hop number
+	if lastValidHopNum > 0 {
+		for _, hopNum := range hopNumbers {
+			if hopNum > lastValidHopNum {
+				delete(m.Hops, hopNum)
+			}
+		}
 	}
 }
 
